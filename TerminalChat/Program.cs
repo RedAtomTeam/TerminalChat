@@ -9,6 +9,7 @@ class Program()
 {
     static async Task Main(string[] args)
     {
+        Console.WriteLine("-1");
         var modeOption = new Option<string>(
             new[] { "-m", "--mode" },
             description: "Mode (server/client)",
@@ -39,11 +40,11 @@ class Program()
         rootCommand.AddOption(localPasswordOption);
         rootCommand.AddOption(remotePasswordOption);
 
-        rootCommand.SetHandler((mode, ip, localPort, remotePort, localPassword, remotePassword) =>
+        rootCommand.SetHandler(async (mode, ip, localPort, remotePort, localPassword, remotePassword) =>
         {
             try
             {
-                RunApplication(mode, ip, localPort, remotePort, localPassword, remotePassword);
+                await RunApplication(mode, ip, localPort, remotePort, localPassword, remotePassword);
             }
             catch (Exception ex)
             {
@@ -59,13 +60,13 @@ class Program()
 
     static async Task RunApplication(string mode, string ip, int localPort, int remotePort, string localPassword, string remotePassword)
     {
-        if (localPort < 1024 || localPort > 65535 || remotePort < 1024 || remotePort > 65535) 
+        if ((localPort < 1024 || localPort > 65535) || (mode == "client" && (remotePort < 1024 || remotePort > 65535)))
             throw new ArgumentException("Ports must be between 1024 and 65535.");
 
-        
+
         if (mode.ToLower() == "server")
-        {    
-            StartServerAsync(localPort, localPassword);
+        {
+            await StartServerAsync(localPort, localPassword);
         }
         else
         {
@@ -74,7 +75,7 @@ class Program()
                 IPAddress ipAddress;
                 if (!string.IsNullOrEmpty(ip) && IPAddress.TryParse(ip, out ipAddress))
                 {
-                    StartServerAsync(localPort, localPassword, false);
+                    await StartServerAsync(localPort, localPassword, false);
                     await ConnectToPeerAsync(ip, GetLocalIpAddress(), remotePort, localPort, remotePassword, localPassword);
                 }
                 else throw new ArgumentException("Invalid IP address.");
@@ -96,6 +97,7 @@ class Program()
             using var client = await listener.AcceptTcpClientAsync();
             using var stream = client.GetStream();
 
+
             var buffer = new byte[1024];
             var bytesRead = await stream.ReadAsync(buffer);
             var receivedData = Encoding.UTF8.GetString(buffer, 0, bytesRead).Split('|');
@@ -111,7 +113,7 @@ class Program()
             var peerPort = int.Parse(receivedData[3]);
 
             Console.WriteLine($"Peer connected from {peerIp}:{peerPort}");
-            if (isRecep) 
+            if (isRecep)
                 await ConnectToPeerAsync(peerIp, myIp, peerPort, port, peerPassword, password);
 
         }
