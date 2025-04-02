@@ -1,4 +1,5 @@
-﻿using System.CommandLine;
+﻿using System;
+using System.CommandLine;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -9,7 +10,12 @@ class Program()
 {
     static async Task Main(string[] args)
     {
-        Console.WriteLine("-1");
+        Console.CancelKeyPress += (sender, e) =>
+        {
+            Console.ResetColor(); 
+            Environment.Exit(0); 
+        };
+
         var modeOption = new Option<string>(
             new[] { "-m", "--mode" },
             description: "Mode (server/client)",
@@ -17,34 +23,26 @@ class Program()
         var ipOption = new Option<string>(
             new[] { "-i", "--ip" },
             description: "IP address for client mode");
-        var localPortOption = new Option<int>(
-            new[] { "-lp", "--local_port" },
+        var portOption = new Option<int>(
+            new[] { "-p", "--port" },
             description: "Local port number (default: 8888)",
             getDefaultValue: () => 8888);
-        var remotePortOption = new Option<int>(
-            new[] { "-rp", "--remote_port" },
-            description: "Remote port number (default: 8888)",
-            getDefaultValue: () => 8888);
-        var localPasswordOption = new Option<string>(
-            new[] { "-lP", "--localPassword" },
+        var passwordOption = new Option<string>(
+            new[] { "-P", "--Password" },
             description: "Password for run server");
-        var remotePasswordOption = new Option<string>(
-            new[] { "-rP", "--remotePassword" },
-            description: "Password for connect to server");
 
         var rootCommand = new RootCommand("TerminalMessager");
         rootCommand.AddOption(modeOption);
         rootCommand.AddOption(ipOption);
-        rootCommand.AddOption(localPortOption);
-        rootCommand.AddOption(remotePortOption);
-        rootCommand.AddOption(localPasswordOption);
-        rootCommand.AddOption(remotePasswordOption);
+        rootCommand.AddOption(portOption);
+        rootCommand.AddOption(passwordOption);
 
-        rootCommand.SetHandler(async (mode, ip, localPort, remotePort, localPassword, remotePassword) =>
+        rootCommand.SetHandler(async (mode, ip, port, password) =>
         {
             try
             {
-                await RunApplication(mode, ip, localPort, remotePort, localPassword, remotePassword);
+                Console.WriteLine("Launching application...");
+                await RunApplication(mode, ip, port, password);
             }
             catch (Exception ex)
             {
@@ -53,112 +51,159 @@ class Program()
                 Console.ResetColor();
                 Environment.Exit(1);
             }
-        }, modeOption, ipOption, localPortOption, remotePortOption, localPasswordOption, remotePasswordOption);
+        }, modeOption, ipOption, portOption, passwordOption);
 
         await rootCommand.InvokeAsync(args);
     }
 
-    static async Task RunApplication(string mode, string ip, int localPort, int remotePort, string localPassword, string remotePassword)
+    static async Task RunApplication(string mode, string ip, int port, string password)
     {
-        if ((localPort < 1024 || localPort > 65535) || (mode == "client" && (remotePort < 1024 || remotePort > 65535)))
+        if (port < 1024 || port > 65535)
             throw new ArgumentException("Ports must be between 1024 and 65535.");
 
-
         if (mode.ToLower() == "server")
+            await StartServerAsync(port, password);
+
+        if (mode.ToLower() == "client")
         {
-            await StartServerAsync(localPort, localPassword);
+            if (string.IsNullOrEmpty(ip) || !IPAddress.TryParse(ip, out _))
+                throw new ArgumentException("Valid IP address is required in server mode");
+            await SendMessageAsync(ip, port, password);
         }
-        else
-        {
-            if (mode.ToLower() == "client")
-            {
-                IPAddress ipAddress;
-                if (!string.IsNullOrEmpty(ip) && IPAddress.TryParse(ip, out ipAddress))
-                {
-                    await StartServerAsync(localPort, localPassword, false);
-                    await ConnectToPeerAsync(ip, GetLocalIpAddress(), remotePort, localPort, remotePassword, localPassword);
-                }
-                else throw new ArgumentException("Invalid IP address.");
-            }
-            else throw new ArgumentException("Invalid mode. Use 'server' or 'client'.");
-        }
+        else if(mode != "server" && mode != "client")
+            throw new ArgumentException("Invalid mode. Use 'server' or 'client'");
     }
 
-    static async Task StartServerAsync(int port, string password, bool isRecep = true)
+    static async Task StartServerAsync(int port, string password)
     {
+        Console.WriteLine($"The server is running at: {port}, with password: '{password}'");
+
         var listener = new TcpListener(IPAddress.Any, port);
         listener.Start();
 
-        IPEndPoint localEndPoint = (IPEndPoint)listener.Server.LocalEndPoint!;
-        string myIp = localEndPoint.Address.ToString();
-
         while (true)
         {
-            using var client = await listener.AcceptTcpClientAsync();
-            using var stream = client.GetStream();
-
-
-            var buffer = new byte[1024];
-            var bytesRead = await stream.ReadAsync(buffer);
-            var receivedData = Encoding.UTF8.GetString(buffer, 0, bytesRead).Split('|');
-
-            if (receivedData.Length != 4 || receivedData[0] != password)
+            using (var client = await listener.AcceptTcpClientAsync())
+            using (var stream = client.GetStream())
             {
-                Console.WriteLine("Invalid connection attempt rejected");
-                continue;
+                var buffer = new byte[1024];
+                var bytesRead = await stream.ReadAsync(buffer);
+                if (Encoding.UTF8.GetString(buffer, 0, bytesRead) != password)
+                {
+                    Console.WriteLine("Incoming connection refused - invalid password");
+                    continue;
+                }
+
+                Console.ForegroundColor = ConsoleColor.Yellow;
+
+                var monitor = MonitorConnection(client);
+
+                var receiveTask = Task.Run(async () =>
+                {
+                    var buffer = new byte[1024];
+                    while (true)
+                    {
+                        var bytesRead = await stream.ReadAsync(buffer);
+                        if (bytesRead == 0) break;
+                        Console.ForegroundColor = ConsoleColor.Green;
+                        Console.WriteLine($"- {Encoding.UTF8.GetString(buffer, 0, bytesRead)}");
+                        Console.ForegroundColor = ConsoleColor.Yellow;
+                    }
+                });
+
+                var sendTask = Task.Run(async () =>
+                {
+                    while (true)
+                    {
+                        var message = Console.ReadLine();
+                        if (string.IsNullOrEmpty(message)) continue;
+
+                        stream.WriteAsync(Encoding.UTF8.GetBytes(message));
+                    }
+                });
+
+                await Task.WhenAny(monitor);
+                return;
             }
-
-            var peerPassword = receivedData[1];
-            var peerIp = receivedData[2];
-            var peerPort = int.Parse(receivedData[3]);
-
-            Console.WriteLine($"Peer connected from {peerIp}:{peerPort}");
-            if (isRecep)
-                await ConnectToPeerAsync(peerIp, myIp, peerPort, port, peerPassword, password);
-
         }
     }
 
-    static async Task ConnectToPeerAsync(string ip, string myIp, int port, int myPort, string password, string myPassword)
+    static async Task SendMessageAsync(string ip, int port, string password)
     {
+        Console.WriteLine($"Trying to connect to {ip}:{port} with password: '{password}'");
+
+        using (var client = new TcpClient())
+        {
+            await client.ConnectAsync(ip, port);
+            using (var stream = client.GetStream())
+            {
+
+                stream.WriteAsync(Encoding.UTF8.GetBytes(password));
+                if(!IsConnectionActive(client))
+                {
+                    Console.WriteLine("Connection refused - invalid password");
+                    return;
+                }
+
+                Console.ForegroundColor = ConsoleColor.Yellow;
+
+                var monitor = MonitorConnection(client);
+
+                var receiveTask = Task.Run(async () =>
+                {
+                    var buffer = new byte[1024];
+                    while (true)
+                    {
+                        var bytesRead = await stream.ReadAsync(buffer);
+                        if (bytesRead == 0) break;
+                        Console.ForegroundColor = ConsoleColor.Green;
+                        Console.WriteLine($"- {Encoding.UTF8.GetString(buffer, 0, bytesRead)}");
+                        Console.ForegroundColor = ConsoleColor.Yellow;
+                    }
+                });
+
+                var sendTask = Task.Run(async () =>
+                {
+                    while (true)
+                    {
+                        var message = Console.ReadLine();
+                        if (string.IsNullOrEmpty(message)) continue;
+
+                        stream.WriteAsync(Encoding.UTF8.GetBytes(message));
+                    }
+                });
+
+                await Task.WhenAny(monitor);
+                return;
+            }
+        }
+    }
+
+    static bool IsConnectionActive(TcpClient client)
+    {
+        if (client == null) return false;
+
         try
         {
-            using var client = new TcpClient();
-            await client.ConnectAsync(ip, port);
-            using var stream = client.GetStream();
-
-            var connectionData = $"{password}|{myPassword}|{myIp}|{myPort}";
-            await stream.WriteAsync(Encoding.UTF8.GetBytes(connectionData));
-
-            Console.WriteLine($"Successfully connected to {ip}:{port}");
-            await StartChatSession(stream);
+            return !(client.Client.Poll(1000, SelectMode.SelectRead)) && client.Client.Available == 0 && client.Connected;
         }
-        catch (Exception ex)
+        catch
         {
-            Console.WriteLine($"Failed to connect to peer: {ex.Message}");
+            return false;
         }
     }
 
-    static async Task StartChatSession(NetworkStream stream)
+    static async Task MonitorConnection(TcpClient client)
     {
-        var receiveTask = Task.Run(async () =>
-        {
-            var buffer = new byte[1024];
-            while (true)
-            {
-                var bytesRead = await stream.ReadAsync(buffer);
-                if (bytesRead == 0) break;
-                Console.WriteLine($"\n[Peer]: {Encoding.UTF8.GetString(buffer, 0, bytesRead)}");
-            }
-        });
-
         while (true)
         {
-            Console.Write("You: ");
-            var message = Console.ReadLine();
-            if (string.IsNullOrEmpty(message)) continue;
+            await Task.Delay(3000);
 
-            await stream.WriteAsync(Encoding.UTF8.GetBytes(message));
+            if (!IsConnectionActive(client))
+            {
+                Console.ResetColor();
+                throw new Exception("Connection interrupted");
+            }
         }
     }
 
