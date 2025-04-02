@@ -201,6 +201,8 @@ class Program()
 
             if (!IsConnectionActive(client))
             {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("Connection interrupted");
                 Console.ResetColor();
                 throw new Exception("Connection interrupted");
             }
