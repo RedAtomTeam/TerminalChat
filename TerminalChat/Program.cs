@@ -77,54 +77,24 @@ class Program()
     static async Task StartServerAsync(int port, string password)
     {
         Console.WriteLine($"The server is running at: {port}, with password: '{password}'");
-
         var listener = new TcpListener(IPAddress.Any, port);
         listener.Start();
 
-        while (true)
+        using (var client = await listener.AcceptTcpClientAsync())
+        using (var stream = client.GetStream())
         {
-            using (var client = await listener.AcceptTcpClientAsync())
-            using (var stream = client.GetStream())
-            {
-                var buffer = new byte[1024];
-                var bytesRead = await stream.ReadAsync(buffer);
-                if (Encoding.UTF8.GetString(buffer, 0, bytesRead) != password)
-                {
-                    Console.WriteLine("Incoming connection refused - invalid password");
-                    continue;
-                }
+            var buffer = new byte[1024];
+            var bytesRead = await stream.ReadAsync(buffer);
 
-                Console.ForegroundColor = ConsoleColor.Yellow;
+            if (Encoding.UTF8.GetString(buffer, 0, bytesRead) != password)
+                Console.WriteLine("Incoming connection refused - invalid password");
 
-                var monitor = MonitorConnection(client);
+            Console.WriteLine("Incoming connection accepted:");
+            Console.ForegroundColor = ConsoleColor.Yellow;
 
-                var receiveTask = Task.Run(async () =>
-                {
-                    var buffer = new byte[1024];
-                    while (true)
-                    {
-                        var bytesRead = await stream.ReadAsync(buffer);
-                        if (bytesRead == 0) break;
-                        Console.ForegroundColor = ConsoleColor.Green;
-                        Console.WriteLine($"- {Encoding.UTF8.GetString(buffer, 0, bytesRead)}");
-                        Console.ForegroundColor = ConsoleColor.Yellow;
-                    }
-                });
-
-                var sendTask = Task.Run(async () =>
-                {
-                    while (true)
-                    {
-                        var message = Console.ReadLine();
-                        if (string.IsNullOrEmpty(message)) continue;
-
-                        stream.WriteAsync(Encoding.UTF8.GetBytes(message));
-                    }
-                });
-
-                await Task.WhenAny(monitor);
-                return;
-            }
+            var streamTask = StartChatSession(stream, password);
+            await streamTask;
+            return;
         }
     }
 
@@ -137,52 +107,63 @@ class Program()
             await client.ConnectAsync(ip, port);
             using (var stream = client.GetStream())
             {
-
                 stream.WriteAsync(Encoding.UTF8.GetBytes(password));
+
                 if(!IsConnectionActive(client))
                 {
                     Console.WriteLine("Connection refused - invalid password");
                     return;
                 }
 
+                Console.WriteLine("Connection successful:");
                 Console.ForegroundColor = ConsoleColor.Yellow;
 
-                var monitor = MonitorConnection(client);
-
-                var receiveTask = Task.Run(async () =>
-                {
-                    var buffer = new byte[1024];
-                    while (true)
-                    {
-                        var bytesRead = await stream.ReadAsync(buffer);
-                        if (bytesRead == 0) break;
-                        Console.ForegroundColor = ConsoleColor.Green;
-                        Console.WriteLine($"- {Encoding.UTF8.GetString(buffer, 0, bytesRead)}");
-                        Console.ForegroundColor = ConsoleColor.Yellow;
-                    }
-                });
-
-                var sendTask = Task.Run(async () =>
-                {
-                    while (true)
-                    {
-                        var message = Console.ReadLine();
-                        if (string.IsNullOrEmpty(message)) continue;
-
-                        stream.WriteAsync(Encoding.UTF8.GetBytes(message));
-                    }
-                });
-
-                await Task.WhenAny(monitor);
+                var streamTask = StartChatSession(stream, password);
+                await streamTask;
                 return;
             }
         }
     }
 
+    static public async Task StartChatSession(NetworkStream stream, string password)
+    {
+        var receiveTask = Task.Run(async () =>
+        {
+            var buffer = new byte[1024];
+            while (true)
+            {
+                var bytesRead = await stream.ReadAsync(buffer);
+                if (bytesRead == 0) 
+                    break;
+
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"- {AddXOR(Encoding.UTF8.GetString(buffer, 0, bytesRead), password)}");
+                Console.ForegroundColor = ConsoleColor.Yellow;
+            }
+        });
+
+        var sendTask = Task.Run(async () =>
+        {
+            while (true)
+            {
+                var message = Console.ReadLine();
+                if (string.IsNullOrEmpty(message)) 
+                    continue;
+
+                stream.WriteAsync(Encoding.UTF8.GetBytes(AddXOR(message, password)));
+            }
+        });
+
+        Task.WaitAny(receiveTask, sendTask);
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine("Connection interrupted");
+        Console.ResetColor();
+    }
+
     static bool IsConnectionActive(TcpClient client)
     {
-        if (client == null) return false;
-
+        if (client == null) 
+            return false;
         try
         {
             return !(client.Client.Poll(1000, SelectMode.SelectRead)) && client.Client.Available == 0 && client.Connected;
@@ -193,20 +174,17 @@ class Program()
         }
     }
 
-    static async Task MonitorConnection(TcpClient client)
+    static string AddXOR(string text, string key)
     {
-        while (true)
+        var result = new StringBuilder(text.Length);
+        for (int i = 0; i < text.Length; i++)
         {
-            await Task.Delay(3000);
+            char keyChar = key[i % key.Length];
+            char encryptedChar = (char)(text[i] ^ keyChar);
+            result.Append((encryptedChar).ToString());
 
-            if (!IsConnectionActive(client))
-            {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine("Connection interrupted");
-                Console.ResetColor();
-                throw new Exception("Connection interrupted");
-            }
         }
+        return result.ToString(); 
     }
 
     static string GetLocalIpAddress()
