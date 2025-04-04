@@ -4,7 +4,8 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
-
+using System.Security.Cryptography;
+using TerminalChat;
 
 class Program()
 {
@@ -56,7 +57,7 @@ class Program()
         await rootCommand.InvokeAsync(args);
     }
 
-    static async Task RunApplication(string mode, string ip, int port, string password)
+    private static async Task RunApplication(string mode, string ip, int port, string password)
     {
         if (port < 1024 || port > 65535)
             throw new ArgumentException("Ports must be between 1024 and 65535.");
@@ -74,10 +75,11 @@ class Program()
             throw new ArgumentException("Invalid mode. Use 'server' or 'client'");
     }
 
-    static async Task StartServerAsync(int port, string password)
+    private static async Task StartServerAsync(int port, string password)
     {
-        Console.WriteLine($"The server is running at: {port}, with password: '{password}'");
-        var listener = new TcpListener(IPAddress.Any, port);
+        string ip = GetLocalIpAddress();
+        Console.WriteLine($"The server is running at: {ip}:{port}, with password: '{password}'");
+        var listener = new TcpListener(IPAddress.Parse(ip), port);
         listener.Start();
 
         using (var client = await listener.AcceptTcpClientAsync())
@@ -98,7 +100,7 @@ class Program()
         }
     }
 
-    static async Task SendMessageAsync(string ip, int port, string password)
+    private static async Task SendMessageAsync(string ip, int port, string password)
     {
         Console.WriteLine($"Trying to connect to {ip}:{port} with password: '{password}'");
 
@@ -125,19 +127,38 @@ class Program()
         }
     }
 
-    static public async Task StartChatSession(NetworkStream stream, string password)
+    private static async Task StartChatSession(NetworkStream stream, string password)
     {
+        byte[] key = DeriveKeyFromPassword(password);
+
         var receiveTask = Task.Run(async () =>
         {
-            var buffer = new byte[1024];
+            var buffer = new byte[4096];
             while (true)
             {
-                var bytesRead = await stream.ReadAsync(buffer);
-                if (bytesRead == 0) 
-                    break;
+                await ReadExactly(stream, buffer, 0, 4);
+                int nonceLen = BitConverter.ToInt32(buffer, 0);
+
+                await ReadExactly(stream, buffer, 0, nonceLen);
+                byte[] nonce = buffer[0..nonceLen];
+
+                await ReadExactly(stream, buffer, 0, 4);
+                int tagLen = BitConverter.ToInt32(buffer, 0);
+
+                await ReadExactly(stream, buffer, 0, tagLen);
+                byte[] tag = buffer[0..tagLen];
+
+                await ReadExactly(stream, buffer, 0, 4);
+                int cipherLen = BitConverter.ToInt32(buffer, 0);
+
+                await ReadExactly(stream, buffer, 0, cipherLen);
+                byte[] ciphertext = buffer[0..cipherLen];
+
+                // Дешифруем
+                string message = AesGcmHelper.Decrypt(ciphertext, nonce, tag, key);
 
                 Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine($"- {AddXOR(Encoding.UTF8.GetString(buffer, 0, bytesRead), password)}");
+                Console.WriteLine($"- {message}");
                 Console.ForegroundColor = ConsoleColor.Yellow;
             }
         });
@@ -146,11 +167,18 @@ class Program()
         {
             while (true)
             {
-                var message = Console.ReadLine();
+                string message = Console.ReadLine();
                 if (string.IsNullOrEmpty(message)) 
                     continue;
 
-                stream.WriteAsync(Encoding.UTF8.GetBytes(AddXOR(message, password)));
+                var (ciphertext, nonce, tag) = AesGcmHelper.Encrypt(message, key);
+
+                await stream.WriteAsync(BitConverter.GetBytes(nonce.Length));
+                await stream.WriteAsync(nonce);
+                await stream.WriteAsync(BitConverter.GetBytes(tag.Length));
+                await stream.WriteAsync(tag);
+                await stream.WriteAsync(BitConverter.GetBytes(ciphertext.Length));
+                await stream.WriteAsync(ciphertext);
             }
         });
 
@@ -160,7 +188,7 @@ class Program()
         Console.ResetColor();
     }
 
-    static bool IsConnectionActive(TcpClient client)
+    private static bool IsConnectionActive(TcpClient client)
     {
         if (client == null) 
             return false;
@@ -174,7 +202,31 @@ class Program()
         }
     }
 
-    static string AddXOR(string text, string key)
+    private static byte[] DeriveKeyFromPassword(string password)
+    {
+        byte[] salt = Encoding.UTF8.GetBytes("FixedChatSalt123");
+
+        using var pbkdf2 = new Rfc2898DeriveBytes(
+            password,
+            salt,
+            100_000,
+            HashAlgorithmName.SHA256);
+
+        return pbkdf2.GetBytes(32); 
+    }
+
+    private static async Task ReadExactly(NetworkStream stream, byte[] buffer, int offset, int count)
+    {
+        int read = 0;
+        while (read < count)
+        {
+            int bytes = await stream.ReadAsync(buffer, offset + read, count - read);
+            if (bytes == 0) throw new EndOfStreamException();
+            read += bytes;
+        }
+    }
+
+    private static string AddXOR(string text, string key)
     {
         var result = new StringBuilder(text.Length);
         for (int i = 0; i < text.Length; i++)
@@ -182,12 +234,11 @@ class Program()
             char keyChar = key[i % key.Length];
             char encryptedChar = (char)(text[i] ^ keyChar);
             result.Append((encryptedChar).ToString());
-
         }
         return result.ToString(); 
     }
 
-    static string GetLocalIpAddress()
+    private static string GetLocalIpAddress()
     {
         var host = Dns.GetHostEntry(Dns.GetHostName());
         return host.AddressList
